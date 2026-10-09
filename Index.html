@@ -1,0 +1,214 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+contract OmniSyntheticLendingVault {
+    struct LenderPosition {
+        uint256 suppliedETH;
+        uint256 accruedInterest;
+        bool isActive;
+    }
+
+    struct BorrowerPosition {
+        uint256 collateralETH;
+        uint256 borrowedDebt;
+        uint256 maxCreditLimit;
+        bool isOpen;
+    }
+
+    address payable public immutable protocolDirector;
+    string public protocolDescriptor;
+    uint256 public borrowInterestBps; // 300 = 3%
+    uint256 public totalSuppliedReserve;
+    uint256 public totalBorrowedAmount;
+
+    mapping(bytes32 => bool) public supportedAssets;
+    mapping(address => LenderPosition) public lenders;
+    mapping(address => BorrowerPosition) public borrowers;
+
+    event AssetWhitelisted(bytes32 indexed assetKey);
+    event RateAdjusted(uint256 newRateBps);
+    event CapitalBorrowed(address indexed borrower, uint256 amount);
+    event InterestClaimed(address indexed lender, uint256 amount);
+    event PositionClosed(address indexed borrower, uint256 returnedCollateral);
+    event ReserveSupplied(address indexed lender, uint256 amount);
+    event ReservesDrained(address indexed director, uint256 amount);
+    event PositionLiquidated(address indexed borrower, address indexed director, uint256 seized);
+    event CollateralLocked(address indexed borrower, uint256 amount, uint256 creditLimit);
+    event LimitRebalanced(address indexed borrower, uint256 newLimit);
+    event DebtRepaid(address indexed borrower, uint256 amount);
+    event DescriptorUpdated(string newDescriptor);
+
+    modifier onlyDirector() {
+        require(msg.sender == protocolDirector, "OmniVault: Unauthorized");
+        _;
+    }
+
+    constructor() {
+        protocolDirector = payable(msg.sender);
+        protocolDescriptor = "Omni Base Synthetic Lending Vault v1";
+        borrowInterestBps = 300; // 3%
+        supportedAssets[0x424153455f415353455400000000000000000000000000000000000000000000] = true;
+    }
+
+    // 1. addCollateralAsset
+    function addCollateralAsset(bytes32 assetKey) external onlyDirector {
+        require(!supportedAssets[assetKey], "OmniVault: Asset already supported");
+        supportedAssets[assetKey] = true;
+        emit AssetWhitelisted(assetKey);
+    }
+
+    // 2. adjustInterestRate
+    function adjustInterestRate(uint256 newRateBps) external onlyDirector {
+        require(newRateBps <= 2000, "OmniVault: Max rate 20%");
+        borrowInterestBps = newRateBps;
+        emit RateAdjusted(newRateBps);
+    }
+
+    // 3. borrowCapital
+    function borrowCapital(uint256 amount) external {
+        BorrowerPosition storage b = borrowers[msg.sender];
+        require(b.isOpen, "OmniVault: Position not open");
+        require(b.borrowedDebt + amount <= b.maxCreditLimit, "OmniVault: Exceeds limit");
+        require(address(this).balance >= amount, "OmniVault: Insufficient liquidity");
+
+        b.borrowedDebt += amount;
+        totalBorrowedAmount += amount;
+
+        (bool sent, ) = payable(msg.sender).call{value: amount}("");
+        require(sent, "OmniVault: Borrow transfer failed");
+
+        emit CapitalBorrowed(msg.sender, amount);
+    }
+
+    // 4. claimLenderInterest
+    function claimLenderInterest(uint256 amount) external {
+        LenderPosition storage lp = lenders[msg.sender];
+        require(lp.isActive, "OmniVault: Inactive lender");
+        require(amount <= lp.accruedInterest, "OmniVault: Exceeds interest");
+
+        lp.accruedInterest -= amount;
+        if (amount > 0) {
+            (bool sent, ) = payable(msg.sender).call{value: amount}("");
+            require(sent, "OmniVault: Claim failed");
+        }
+
+        emit InterestClaimed(msg.sender, amount);
+    }
+
+    // 5. closeBorrowerPosition
+    function closeBorrowerPosition() external {
+        BorrowerPosition storage b = borrowers[msg.sender];
+        require(b.isOpen, "OmniVault: Not open");
+        require(b.borrowedDebt == 0, "OmniVault: Debt outstanding");
+
+        uint256 refund = b.collateralETH;
+        b.collateralETH = 0;
+        b.isOpen = false;
+
+        if (refund > 0) {
+            (bool sent, ) = payable(msg.sender).call{value: refund}("");
+            require(sent, "OmniVault: Refund failed");
+        }
+
+        emit PositionClosed(msg.sender, refund);
+    }
+
+    // 6. depositLenderReserve
+    function depositLenderReserve() external payable {
+        require(msg.value > 0, "OmniVault: Zero deposit");
+
+        LenderPosition storage lp = lenders[msg.sender];
+        lp.suppliedETH += msg.value;
+        lp.isActive = true;
+        totalSuppliedReserve += msg.value;
+
+        emit ReserveSupplied(msg.sender, msg.value);
+    }
+
+    // 7. emergencyDrainReserves
+    function emergencyDrainReserves() external onlyDirector {
+        uint256 surplus = address(this).balance > totalSuppliedReserve ? address(this).balance - totalSuppliedReserve : 0;
+        if (surplus == 0 && address(this).balance > 0 && totalBorrowedAmount == 0) {
+            surplus = address(this).balance;
+        }
+        require(surplus > 0, "OmniVault: Zero surplus");
+
+        (bool sent, ) = protocolDirector.call{value: surplus}("");
+        require(sent, "OmniVault: Sweep failed");
+
+        emit ReservesDrained(protocolDirector, surplus);
+    }
+
+    // 8. liquidatePosition
+    function liquidatePosition(address borrower) external onlyDirector {
+        BorrowerPosition storage b = borrowers[borrower];
+        require(b.isOpen && b.borrowedDebt > 0, "OmniVault: No liquidation debt");
+
+        uint256 seized = b.collateralETH;
+        b.collateralETH = 0;
+        b.borrowedDebt = 0;
+        b.isOpen = false;
+
+        if (seized > 0) {
+            (bool sent, ) = protocolDirector.call{value: seized}("");
+            require(sent, "OmniVault: Seize transfer failed");
+        }
+
+        emit PositionLiquidated(borrower, protocolDirector, seized);
+    }
+
+    // 9. lockCollateral
+    function lockCollateral(uint256 creditLimit) external payable {
+        require(msg.value > 0, "OmniVault: Zero collateral");
+        require(creditLimit > 0, "OmniVault: Zero limit");
+
+        BorrowerPosition storage b = borrowers[msg.sender];
+        b.collateralETH += msg.value;
+        b.maxCreditLimit = creditLimit;
+        b.isOpen = true;
+
+        emit CollateralLocked(msg.sender, msg.value, creditLimit);
+    }
+
+    // 10. rebalanceCreditLimit
+    function rebalanceCreditLimit(address borrower, uint256 newLimit) external onlyDirector {
+        BorrowerPosition storage b = borrowers[borrower];
+        require(b.isOpen, "OmniVault: Not open");
+        require(newLimit >= b.borrowedDebt, "OmniVault: Below debt");
+
+        b.maxCreditLimit = newLimit;
+        emit LimitRebalanced(borrower, newLimit);
+    }
+
+    // 11. repayDebt
+    function repayDebt() external payable {
+        BorrowerPosition storage b = borrowers[msg.sender];
+        require(b.isOpen && b.borrowedDebt > 0, "OmniVault: No debt");
+        require(msg.value > 0, "OmniVault: Zero payment");
+
+        uint256 repayActual = msg.value > b.borrowedDebt ? b.borrowedDebt : msg.value;
+        b.borrowedDebt -= repayActual;
+        totalBorrowedAmount -= repayActual;
+
+        if (msg.value > repayActual) {
+            uint256 refund = msg.value - repayActual;
+            (bool sent, ) = payable(msg.sender).call{value: refund}("");
+            require(sent, "OmniVault: Refund failed");
+        }
+
+        emit DebtRepaid(msg.sender, repayActual);
+    }
+
+    // 12. updateProtocolDescriptor
+    function updateProtocolDescriptor(string calldata newDescriptor) external onlyDirector {
+        require(bytes(newDescriptor).length > 0, "OmniVault: Empty string");
+        protocolDescriptor = newDescriptor;
+        emit DescriptorUpdated(newDescriptor);
+    }
+
+    // Read-метод
+    function getBorrower(address account) external view returns (uint256 collateral, uint256 debt, uint256 limit, bool open) {
+        BorrowerPosition memory b = borrowers[account];
+        return (b.collateralETH, b.borrowedDebt, b.maxCreditLimit, b.isOpen);
+    }
+}
